@@ -87,7 +87,7 @@ def browse_file(log):
 
 
 save_name = "F:/work/cs231/project/examination/ijcv2007/results/result.jpg"
-# def save_file(log):
+# def save_file(log):   
 #     save_name.append("F:/work/cs231/project/result")
 #     log.insert(INSERT, 'Output image name and save location: '+save_name[-1]+'\n')
 
