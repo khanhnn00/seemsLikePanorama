@@ -1,154 +1,267 @@
-import os, os.path
-import cv2
+import cv2 as cv
 import numpy as np
+import pysift
+from PIL import Image
+from collections import OrderedDict
 
-def getStitchedImage(img1, img2, M):
-    '''
-    function to compute stitched img based on two input imgs anda given homography matrix
-    Input:
-        two images
-        a calculated hography matrix
-    Output:
-        a stitched image 
-    '''
-    w1, h1 = img1.shape[:2]
-    w2, h2 = img2.shape[:2]
+# Reminder tuning variables
+FEATURES_FIND_CHOICES = OrderedDict()
+FEATURES_FIND_CHOICES['ORB'] = cv.ORB.create
+FEATURES_FIND_CHOICES['BRISK'] = cv.BRISK_create
+FEATURES_FIND_CHOICES['AKAZE'] = cv.AKAZE_create
 
-    # Getting the canvas dimesions
-    img1_dims = np.float32([[0, 0], [0, w1], [h1, w1], [h1, 0]]).reshape(-1, 1, 2)
-    img2_dims_temp = np.float32([[0, 0], [0, w2], [h2, w2], [h2, 0]]).reshape(-1, 1, 2)
+WARP_CHOICES = (
+    'spherical',
+    'plane',
+    'cyclindrical',
+)
 
-    # Getting relative perspective of the second image
-    img2_dims = cv2.perspectiveTransform(img2_dims_temp, M)
+WAVE_CORRECT_CHOICES = ('horiz', 'vert', 'no',)
 
-    result_dims = np.concatenate((img1_dims, img2_dims), axis=0)
+BLEND_CHOICES = ('multiband', 'feather', 'no',)
 
-    # Calculating dimensions of match points
-    [x_min, y_min] = np.int32(result_dims.min(axis=0).ravel() - 0.5)
-    [x_max, y_max] = np.int32(result_dims.max(axis=0).ravel() + 0.5)
+class Panorama:
+    def __init__(self, output, img_names, desc, try_cuda, match_conf, wave_correct, warp, blend, blend_strength):
+        self.log = ''
+        self.img_names = img_names
+        self.output = output
+        self.work_megapix = 0.6
+        self.seam_megapix = 0.1
+        self.compose_megapix = -1
+        self.work_scale = 0
+        self.finder = FEATURES_FIND_CHOICES[desc]()
+        self.seam_work_aspect = 1
+        self.full_img_sizes = []
+        self.features = []
+        self.images = []
+        self.is_work_scale_set = False
+        self.is_seam_scale_set = False
+        # self.matcher = cv.detail.BestOf2NearestMatcher_create(try_cuda, match_conf)
+        self.matcher = cv.detail_BestOf2NearestMatcher(try_cuda, match_conf)
 
-    # Creating output array after affine transformation
-    transform_dist = [-x_min, -y_min]
-    transform_array = np.array([[1, 0, transform_dist[0]],
-                                [0, 1, transform_dist[1]],
-                                [0, 0, 1]])
+        self.is_compose_scale_set = False       
+        self.p = None
+        self.num_images = 0
+        self.cameras = None
+        self.warped_image_scale = 0
+        self.corners = []
+        self.masks_warped = []
+        self.images_warped = []
+        self.sizes = []
+        self.masks = []
+        self.K = None
 
-    # Warp images to get the resulting image
-    result_img = cv2.warpPerspective(img2, transform_array.dot(M),
-                                     (x_max - x_min, y_max - y_min))
-    result_img[transform_dist[1]:w1 + transform_dist[1],
-    transform_dist[0]:h1 + transform_dist[0]] = img1
+        self.wave_correct = wave_correct
+        self.warp_type = warp
+        self.blend_type = blend
+        self.blend_strength = blend_strength
 
-    # All done now just return img :)
-    return result_img
+    def clear_log(self):
+        self.log = ''
 
+    def read_images(self):
+        # Check every filename
+        for name in self.img_names:
+            full_img = cv.imread(name)
+            # If not image
+            if full_img is None:
+                self.log = self.log + 'Cannot read ' + name + '\n'
+            else:
+                # Add image shape info
+                self.full_img_sizes.append((full_img.shape[1], full_img.shape[0]))
+                # No resize
+                if self.work_megapix < 0:
+                    img = full_img
+                    self.work_scale = 1
+                    self.is_work_scale_set = True
+                else:
+                    # Find scale on first run
+                    if self.is_work_scale_set is False:
+                        self.work_scale = min(1.0, np.sqrt(self.work_megapix * 1e6 / (full_img.shape[0] * full_img.shape[1])))
+                        self.is_work_scale_set = True
+                    # Resize
+                    img = cv.resize(src=full_img, dsize=None, fx=self.work_scale, fy=self.work_scale, interpolation=cv.INTER_LINEAR_EXACT)
+                # Find seam scale on first run
+                if self.is_seam_scale_set is False:
+                    seam_scale = min(1.0, np.sqrt(self.seam_megapix * 1e6 / (full_img.shape[0] * full_img.shape[1])))
+                    self.seam_work_aspect = seam_scale / self.work_scale
+                    self.is_seam_scale_set = True
+                # Find keypoints and describe
+                img_feat = cv.detail.computeImageFeatures2(self.finder, img)
+                self.features.append(img_feat)
+                img = cv.resize(src=full_img, dsize=None, fx=seam_scale, fy=seam_scale, interpolation=cv.INTER_LINEAR_EXACT)
+                print(img.shape)
+                self.images.append(img)
 
+    def match(self):
+        # Find 2 best matches for each feature
+        self.p = self.matcher.apply2(self.features)
+        self.matcher.collectGarbage()
+        
+        # Find largest subset of images that matches, removing duplicates and outlier
+        indices = cv.detail.leaveBiggestComponent(self.features, self.p, 0.3)
+        img_subset = []
+        img_names_subset = []
+        full_img_sizes_subset = []
+        # Replacing full set with subset
+        for i in range(len(indices)):
+            img_names_subset.append(self.img_names[indices[i, 0]])
+            img_subset.append(self.images[indices[i, 0]])
+            full_img_sizes_subset.append(self.full_img_sizes[indices[i, 0]])
+        self.images = img_subset
+        self.img_names = img_names_subset
+        self.full_img_sizes = full_img_sizes_subset
+        self.num_images = len(self.img_names)
+        if self.num_images < 2:
+            self.log = self.log + 'Not enough images\n'
+            exit()
+        
+        # Estimate homography
+        estimator = cv.detail_HomographyBasedEstimator()
+        status, self.cameras = estimator.apply(self.features, self.p, None)
+        if not status:
+            self.log = self.log + 'Homography estimation failed\n'
+            exit()
+        for cam in self.cameras:
+            cam.R = cam.R.astype(np.float32)
+            print(cam.R.shape)
+        
+        # Bundle adjustment, changing camera parameters from the most matched image pair downward
+        adjuster = cv.detail_BundleAdjusterRay()
+        adjuster.setConfThresh(1)
+        adjuster.setRefinementMask(np.zeros((3, 3), np.uint8))
+        status, self.cameras = adjuster.apply(self.features, self.p, self.cameras)
+        if not status:
+            self.log = self.log + 'Camera adjusting failed\n'
+            exit()
 
-def getSiftHomography(img1, img2):
-    '''
-    function to compute homography matrix using SIFT
-    Input:
-        two images
-    Output:
-        a calculated homography matrix
-    '''
+    def stitch(self):
+        focals = []
+        for cam in self.cameras:
+            focals.append(cam.focal)
+        sorted(focals)
 
-    sift = cv2.xfeatures2d.SIFT_create()
+        if len(focals) % 2 == 1:
+            self.warped_image_scale = focals[len(focals) // 2]
+        else:
+            self.warped_image_scale = (focals[len(focals) // 2] + focals[len(focals) // 2 - 1]) / 2
+        
+        # Straightening / Wave correction
+        if self.wave_correct != 'No':
+            rmats = []
+            for cam in self.cameras:
+                rmats.append(np.copy(cam.R))
+            if self.wave_correct == 'Horizontal':
+                rmats = cv.detail.waveCorrect(rmats, cv.detail.WAVE_CORRECT_HORIZ)
+            else:
+                rmats = cv.detail.waveCorrect(rmats, cv.detail.WAVE_CORRECT_VERT)
+            for idx, cam in enumerate(self.cameras):
+                cam.R = rmats[idx]
+        
+        # Create mask for every image
+        for i in range(0, self.num_images):
+            um = cv.UMat(255 * np.ones((self.images[i].shape[0], self.images[i].shape[1]), np.uint8))
+            self.masks.append(um)
 
-    # Extract keypoints and descriptors
-    k1, d1 = sift.detectAndCompute(img1, None)
-    k2, d2 = sift.detectAndCompute(img2, None)
+        # Warping at low resolution to estimate exposure and find seam mark - quality/time tradeoff
+        warper = cv.PyRotationWarper(self.warp_type, self.warped_image_scale * self.seam_work_aspect)
+        for idx in range(0, self.num_images):
+            self.K = self.cameras[idx].K().astype(np.float32)
+            self.K[0, 0] *= self.seam_work_aspect
+            self.K[0, 2] *= self.seam_work_aspect
+            self.K[1, 1] *= self.seam_work_aspect
+            self.K[1, 2] *= self.seam_work_aspect
+            corner, image_wp = warper.warp(self.images[idx], self.K, self.cameras[idx].R, cv.INTER_LINEAR, cv.BORDER_REFLECT)
+            self.corners.append(corner)
+            self.sizes.append((image_wp.shape[1], image_wp.shape[0]))
+            self.images_warped.append(image_wp)
+            self.p, mask_wp = warper.warp(self.masks[idx], self.K, self.cameras[idx].R, cv.INTER_NEAREST, cv.BORDER_CONSTANT)
+            self.masks_warped.append(mask_wp.get())
+        
+    def refine(self):
+        # Prepare Exposure/Gain/Intensity Compensation
+        compensator = cv.detail.ExposureCompensator_createDefault(cv.detail.ExposureCompensator_GAIN_BLOCKS)
+        compensator.feed(corners=self.corners, images=self.images_warped, masks=self.masks_warped)
 
-    # Bruteforce matcher on the descriptors
-    bf = cv2.BFMatcher()
-    matches = bf.knnMatch(d1, d2, k=2)
+        # Convert
+        images_warped_f = []
+        for img in self.images_warped:
+            imgf = img.astype(np.float32)
+            images_warped_f.append(imgf)
+        # Find optimal seam line to blend
+        seam_finder = cv.detail_GraphCutSeamFinder('COST_COLOR')
+        seam_finder.find(images_warped_f, self.corners, self.masks_warped)
 
+        compose_scale = 1
+        self.corners = []
+        self.sizes = []
+        blender = None
 
-    verify_ratio = 0.8  # sauce: dont ask pls
-    verified_matches = []
-    for m1, m2 in matches:
-        if m1.distance < 0.8 * m2.distance:
-            verified_matches.append(m1)
+        for idx, name in enumerate(self.img_names):
+            # Read image again \\ wtf
+            full_img = cv.imread(name)
+            # Find scale at first image
+            if self.is_compose_scale_set == False:
+                if self.compose_megapix > 0:
+                    compose_scale = min(1.0, np.sqrt(self.compose_megapix * 1e6 / (full_img.shape[0] * full_img.shape[1])))
+                self.is_compose_scale_set = True
+                compose_work_aspect = compose_scale / self.work_scale
+                self.warped_image_scale *= compose_work_aspect
+                # Prepare war   
+                self.warper = cv.PyRotationWarper(self.warp_type, self.warped_image_scale)
+                for i in range(0, len(self.img_names)):
+                    self.cameras[i].focal *= compose_work_aspect
+                    self.cameras[i].ppx *= compose_work_aspect
+                    self.cameras[i].ppy *= compose_work_aspect
+                    sz = (self.full_img_sizes[i][0] * compose_scale, self.full_img_sizes[i][1] * compose_scale)
+                    self.K = self.cameras[i].K().astype(np.float32)
+                    roi = self.warper.warpRoi(sz, self.K, self.cameras[i].R)
+                    self.corners.append(roi[0:2])
+                    self.sizes.append(roi[2:4])
 
-    min_matches = 8
-    if len(verified_matches) > min_matches:
+            if abs(compose_scale - 1) > 1e-1:
+                img = cv.resize(src=full_img, dsize=None, fx=compose_scale, fy=compose_scale, interpolation=cv.INTER_LINEAR_EXACT)
+            else:
+                img = full_img
+            # Warp
+            self.K = self.cameras[idx].K().astype(np.float32)
+            corner, image_warped = self.warper.warp(img, self.K, self.cameras[idx].R, cv.INTER_LINEAR, cv.BORDER_REFLECT)
+            mask = 255 * np.ones((img.shape[0], img.shape[1]), np.uint8)
+            p, mask_warped = self.warper.warp(mask, self.K, self.cameras[idx].R, cv.INTER_NEAREST, cv.BORDER_CONSTANT)
+            # Compensate exposure
+            compensator.apply(idx, self.corners[idx], image_warped, mask_warped)
+            image_warped_s = image_warped.astype(np.int16)
+            # Create seam mask at original resolution
+            dilated_mask = cv.dilate(self.masks_warped[idx], None)
+            seam_mask = cv.resize(dilated_mask, (mask_warped.shape[1], mask_warped.shape[0]), 0, 0, cv.INTER_LINEAR_EXACT)
+            mask_warped = cv.bitwise_and(seam_mask, mask_warped)
+            
+            # Blend
+            if blender is None:
+                dst = cv.detail.resultRoi(corners=self.corners, sizes=self.sizes)
+                blend_width = np.sqrt(dst[2] * dst[3]) * self.blend_strength / 100
+                if blend_width < 1 or self.blend_type == 'No':
+                    blender = cv.detail.Blender_createDefault(cv.detail.Blender_NO)
+                elif self.blend_type == 'Multiband':
+                    blender = cv.detail_MultiBandBlender()
+                    blender.setNumBands((np.log(blend_width) / np.log(2.) - 1.).astype(np.int))
+                elif self.blend_type == 'Feather':
+                    blender = cv.detail_FeatherBlender()
+                    blender.setSharpness(1. / blend_width)
+                blender.prepare(dst)
+            
+            blender.feed(cv.UMat(image_warped_s), mask_warped, self.corners[idx])
 
-        img1_pts = []
-        img2_pts = []
+        # Final image
+        result = None
+        result_mask = None
+        result, result_mask = blender.blend(result, result_mask)
 
-        for match in verified_matches:
-            img1_pts.append(k1[match.queryIdx].pt)
-            img2_pts.append(k2[match.trainIdx].pt)
-        img1_pts = np.float32(img1_pts).reshape(-1, 1, 2)
-        img2_pts = np.float32(img2_pts).reshape(-1, 1, 2)
-
-        # Computing homography matrix
-        M, mask = cv2.findHomography(img1_pts, img2_pts, cv2.RANSAC, 5.0)
-        return M
-    else:
-        orint("Not enough matches")
-        return False
-
-def equalizeHistogram(img):
-    '''
-    function to equalize histogram
-    Input:
-        an image
-    Output:
-        an image after being equalized
-    '''
-
-    img_yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
-    img_yuv[:, :, 0] = cv2.equalizeHist(img_yuv[:, :, 0])
-    img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
-    return img
-
-def getImage():
-    '''
-    function to init neccesary images
-    Input:
-        none, we use static url kekw
-    Output:
-        set of images with histogram equalization
-    '''
-    path = 'inputs' #feel free to change this to ur img folder
-
-    temps = []
-    allowed_ext = [".jpg", ".gif", ".png", ".tga", ".jpeg"]
-    for f in os.listdir(path):
-        ext = os.path.splitext(f)[1]
-        if ext.lower() not in allowed_ext:
-            continue
-        temps.append(cv2.imread(os.path.join(path, f)))
-
-    imgs = []
-    for i in temps:
-        imgs.append(equalizeHistogram(i))
-
-    return imgs
-
-def panorama():
-    '''
-    main function
-    '''
-    imgs = getImage()
-    result_image = imgs[0]
-    for i in range(1, len(imgs)):
-        M = getSiftHomography(result_image, imgs[i])
-        result_image = getStitchedImage(imgs[i], result_image, M)
-
-    cv2.imwrite('result.jpg', result_image)
-    if result_image.shape[1]<1500:
-        cv2.imshow('result',result_image)
+        cv.imwrite(self.output, result)
+        res = Image.open(self.output)
+        res.show()
 
 def main():
-    '''
-    just a main function to call main function idk why
-    '''
-    panorama()
-
-if __name__ == '__main__':
-    '''
-    ... k why we need this?
-    '''
-    main()
+    path = 'inputs3'
+    imgs_name = os.listdir(path)
+    panorama = panorama()
