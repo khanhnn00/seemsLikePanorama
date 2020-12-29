@@ -6,6 +6,7 @@ from collections import OrderedDict
 
 # Reminder tuning variables
 FEATURES_FIND_CHOICES = OrderedDict()
+FEATURES_FIND_CHOICES['SIFT'] = cv.SIFT_create
 FEATURES_FIND_CHOICES['ORB'] = cv.ORB.create
 FEATURES_FIND_CHOICES['BRISK'] = cv.BRISK_create
 FEATURES_FIND_CHOICES['AKAZE'] = cv.AKAZE_create
@@ -68,6 +69,7 @@ class Panorama:
                 self.log = self.log + 'Cannot read ' + name + '\n'
             else:
                 # Add image shape info
+                print('original shape, {}'.format(full_img.shape))
                 self.full_img_sizes.append((full_img.shape[1], full_img.shape[0]))
                 # No resize
                 if self.work_megapix < 0:
@@ -87,24 +89,33 @@ class Panorama:
                     self.seam_work_aspect = seam_scale / self.work_scale
                     self.is_seam_scale_set = True
                 # Find keypoints and describe
+                print('shape before computing keypoints: {}'.format(img.shape))
+                print('finder type: {}'.format(self.finder))
                 img_feat = cv.detail.computeImageFeatures2(self.finder, img)
+                print('keypoints: {}'.format(len(img_feat.getKeypoints())))
+                # print('descriptors: {}'.format(len(img_feat.getDescriptors())))
                 self.features.append(img_feat)
                 img = cv.resize(src=full_img, dsize=None, fx=seam_scale, fy=seam_scale, interpolation=cv.INTER_LINEAR_EXACT)
-                print(img.shape)
+                print('shape after resizing, {}'.format(img.shape))
                 self.images.append(img)
 
     def match(self):
         # Find 2 best matches for each feature
         self.p = self.matcher.apply2(self.features)
+        print('self.p: {}'.format(self.p))
+        print('self.features: {}'.format(self.features))
         self.matcher.collectGarbage()
         
         # Find largest subset of images that matches, removing duplicates and outlier
         indices = cv.detail.leaveBiggestComponent(self.features, self.p, 0.3)
+        print('indices: {}'.format(indices))
         img_subset = []
         img_names_subset = []
         full_img_sizes_subset = []
         # Replacing full set with subset
+        print('self.img_names: {}'.format(self.img_names))
         for i in range(len(indices)):
+            print(i)
             img_names_subset.append(self.img_names[indices[i, 0]])
             img_subset.append(self.images[indices[i, 0]])
             full_img_sizes_subset.append(self.full_img_sizes[indices[i, 0]])
@@ -122,9 +133,11 @@ class Panorama:
         if not status:
             self.log = self.log + 'Homography estimation failed\n'
             exit()
+        # print('self.cameras, {}'.format(self.cameras))
         for cam in self.cameras:
+            # print('cam.R: {}'.format(cam.R))
             cam.R = cam.R.astype(np.float32)
-            print(cam.R.shape)
+            # print('Cam.R.shape, {}'.format(cam.R.shape))
         
         # Bundle adjustment, changing camera parameters from the most matched image pair downward
         adjuster = cv.detail_BundleAdjusterRay()
@@ -198,7 +211,7 @@ class Panorama:
         blender = None
 
         for idx, name in enumerate(self.img_names):
-            # Read image again \\ wtf
+            # Read image again 
             full_img = cv.imread(name)
             # Find scale at first image
             if self.is_compose_scale_set == False:
@@ -231,7 +244,7 @@ class Panorama:
             # Compensate exposure
             compensator.apply(idx, self.corners[idx], image_warped, mask_warped)
             image_warped_s = image_warped.astype(np.int16)
-            # Create seam mask at original resolution
+            # # Create seam mask at original resolution
             dilated_mask = cv.dilate(self.masks_warped[idx], None)
             seam_mask = cv.resize(dilated_mask, (mask_warped.shape[1], mask_warped.shape[0]), 0, 0, cv.INTER_LINEAR_EXACT)
             mask_warped = cv.bitwise_and(seam_mask, mask_warped)

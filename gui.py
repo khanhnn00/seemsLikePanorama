@@ -18,7 +18,7 @@ log = Frame(window)
 #Widgets for config1
 lb_desc = Label(config1, text='Descriptor')
 combo_desc = Combobox(config1, justify='center')
-combo_desc['value'] = ('ORB')
+combo_desc['value'] = ('SIFT','ORB')
 
 lb_conf = Label(config1, text='Match confidence')
 spin_conf = Spinbox(config1, from_=0, to=1, format="%.1f", increment=0.1, justify='center')
@@ -50,7 +50,7 @@ combo_warp['value'] = ('Spherical', 'Plane', 'Cylindrical')
 #Widgets for config3
 lb_blend = Label(config3, text='Blending')
 combo_blend = Combobox(config3, justify='center')
-combo_blend['value'] = ('Multiband')
+combo_blend['value'] = ('Multiband', 'No')
 
 lb_str = Label(config3, text='strength')
 spin_str = Spinbox(config3, from_=0, to=100, justify='center')
